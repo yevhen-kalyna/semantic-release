@@ -16,7 +16,7 @@ const {extractErrors, makeTag} = require('./lib/utils');
 const getGitAuthUrl = require('./lib/get-git-auth-url');
 const getBranches = require('./lib/branches');
 const getLogger = require('./lib/get-logger');
-const {verifyAuth, isBranchUpToDate, getGitHead, tag, push, pushNotes, getTagHead, addNote} = require('./lib/git');
+const {verifyAuth, isBranchUpToDate, getGitHead, tag, push, pushNotes, getTagHead, addNote, fetchNotes} = require('./lib/git');
 const getError = require('./lib/get-error');
 const {COMMIT_NAME, COMMIT_EMAIL} = require('./lib/definitions/constants');
 
@@ -36,6 +36,25 @@ async function run(context, plugins) {
   const {cwd, env, options, logger} = context;
   const {isCi, branch, prBranch, isPr} = context.envCi;
   const ciBranch = isPr ? prBranch : branch;
+
+  async function executeWithRetry(functionA, functionB, delay, retryCount) {
+    logger.log(`Retrying function ${functionA.name} ${retryCount} times with ${delay}ms delay`);
+    for (let attempt = 0; attempt < retryCount; attempt++) {
+        try {
+            logger.log(`Attempt ${attempt + 1} of ${retryCount}`);
+            await functionA();
+            return; // If functionA succeeds, exit the loop
+        } catch (error) {
+            logger.warn(`Attempt ${attempt + 1} of ${retryCount} failed`);
+            await functionB(); // Call functionB if functionA throws an error
+            if (attempt < retryCount - 1) {
+                logger.log(`Waiting ${delay}ms before retrying function ${functionA.name}`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+    logger.error(`Function ${functionA.name} failed ${retryCount} times`);
+  }
 
   if (!isCi && !options.dryRun && !options.noCi) {
     logger.warn('This run was not triggered in a known CI environment, running in dry-run mode.');
@@ -120,8 +139,11 @@ async function run(context, plugins) {
       if (options.dryRun) {
         logger.warn(`Skip ${nextRelease.gitTag} tag creation in dry-run mode`);
       } else {
+        logger.warn(`Adding notes to branch ${context.branch.name}`)
         await addNote({channels: [...currentRelease.channels, nextRelease.channel]}, nextRelease.gitHead, {cwd, env});
+        logger.warn(`Pushing tag to branch ${context.branch.name}`)
         await push(options.repositoryUrl, {cwd, env});
+        logger.warn(`Pushing notes to branch ${context.branch.name}`)
         await pushNotes(options.repositoryUrl, {cwd, env});
         logger.success(
           `Add ${nextRelease.channel ? `channel ${nextRelease.channel}` : 'default channel'} to tag ${
@@ -196,10 +218,20 @@ async function run(context, plugins) {
     logger.warn(`Skip ${nextRelease.gitTag} tag creation in dry-run mode`);
   } else {
     // Create the tag before calling the publish plugins as some require the tag to exists
+    logger.log(`Creating tag ${nextRelease.gitTag}`)
     await tag(nextRelease.gitTag, nextRelease.gitHead, {cwd, env});
+    logger.warn(`Adding notes to branch ${context.branch.name}`)
     await addNote({channels: [nextRelease.channel]}, nextRelease.gitHead, {cwd, env});
+    logger.warn(`Pushing tag to branch ${context.branch.name}`)
     await push(options.repositoryUrl, {cwd, env});
-    await pushNotes(options.repositoryUrl, {cwd, env});
+    logger.warn(`Pushing notes to branch ${context.branch.name}`)
+    // await pushNotes(options.repositoryUrl, {cwd, env});
+    await executeWithRetry(
+      () => pushNotes(options.repositoryUrl, {cwd, env}),
+      () => fetchNotes(options.repositoryUrl, {cwd, env}),
+      5000,
+      5
+    );
     logger.success(`Created tag ${nextRelease.gitTag}`);
   }
 
